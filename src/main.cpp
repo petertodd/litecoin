@@ -1236,7 +1236,7 @@ void static InvalidBlockFound(CBlockIndex *pindex) {
     }
 }
 
-bool ConnectBestBlock(CValidationState &state) {
+bool ConnectBestBlock(CValidationState &state, bool fCheckUnspendable) {
     do {
         CBlockIndex *pindexNewBest;
 
@@ -1275,7 +1275,7 @@ bool ConnectBestBlock(CValidationState &state) {
                 BOOST_FOREACH(CBlockIndex *pindexSwitch, vAttach) {
                     boost::this_thread::interruption_point();
                     try {
-                        if (!SetBestChain(state, pindexSwitch))
+                        if (!SetBestChain(state, pindexSwitch, fCheckUnspendable))
                             return false;
                     } catch(std::runtime_error &e) {
                         return state.Abort(_("System error: ") + e.what());
@@ -1390,7 +1390,7 @@ bool VerifySignature(const CCoins& txFrom, const CTransaction& txTo, unsigned in
     return CScriptCheck(txFrom, txTo, nIn, flags, nHashType)();
 }
 
-bool CTransaction::CheckInputs(CValidationState &state, CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, std::vector<CScriptCheck> *pvChecks) const
+bool CTransaction::CheckInputs(CValidationState &state, CCoinsViewCache &inputs, bool fScriptChecks, unsigned int flags, std::vector<CScriptCheck> *pvChecks, bool fCheckUnspendable) const
 {
     if (!IsCoinBase())
     {
@@ -1418,10 +1418,13 @@ bool CTransaction::CheckInputs(CValidationState &state, CCoinsViewCache &inputs,
                     return state.Invalid(error("CheckInputs() : tried to spend coinbase at depth %d", nSpendHeight - coins.nHeight));
             }
 
-            // Check for negative or overflow input values
-            nValueIn += coins.vout[prevout.n].nValue;
-            if (!MoneyRange(coins.vout[prevout.n].nValue) || !MoneyRange(nValueIn))
+            // Check for unspendable, negative or overflow input values
+            int64 nInputValue = coins.vout[prevout.n].nValue;
+            if (fCheckUnspendable && nInputValue && nInputValue < MIN_SPENDABLE)
+                return state.DoS(100, error("CheckInputs() : txin value is too small to be spendable"));
+            if (!MoneyRange(nInputValue) || !MoneyRange(nValueIn))
                 return state.DoS(100, error("CheckInputs() : txin values out of range"));
+            nValueIn += nInputValue;
 
         }
 
@@ -1592,7 +1595,7 @@ void ThreadScriptCheck() {
     scriptcheckqueue.Thread();
 }
 
-bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsViewCache &view, bool fJustCheck)
+bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsViewCache &view, bool fJustCheck, bool fCheckUnspendable)
 {
     // Check it again in case a previous version let a bad block in
     if (!CheckBlock(state, !fJustCheck, !fJustCheck))
@@ -1677,7 +1680,9 @@ bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsVi
             nFees += tx.GetValueIn(view)-tx.GetValueOut();
 
             std::vector<CScriptCheck> vChecks;
-            if (!tx.CheckInputs(state, view, fScriptChecks, flags, nScriptCheckThreads ? &vChecks : NULL))
+            if (!tx.CheckInputs(state, view, fScriptChecks, flags,
+                                nScriptCheckThreads ? &vChecks : NULL,
+                                fCheckUnspendable))
                 return false;
             control.Add(vChecks);
         }
@@ -1742,7 +1747,7 @@ bool CBlock::ConnectBlock(CValidationState &state, CBlockIndex* pindex, CCoinsVi
     return true;
 }
 
-bool SetBestChain(CValidationState &state, CBlockIndex* pindexNew)
+bool SetBestChain(CValidationState &state, CBlockIndex* pindexNew, bool fCheckUnspendable)
 {
     // All modifications to the coin state will be done in this cache.
     // Only when all have succeeded, we push it to pcoinsTip.
@@ -1806,7 +1811,7 @@ bool SetBestChain(CValidationState &state, CBlockIndex* pindexNew)
         if (!block.ReadFromDisk(pindex))
             return state.Abort(_("Failed to read block"));
         int64 nStart = GetTimeMicros();
-        if (!block.ConnectBlock(state, pindex, view)) {
+        if (!block.ConnectBlock(state, pindex, view, false, fCheckUnspendable)) {
             if (state.IsInvalid()) {
                 InvalidChainFound(pindexNew);
                 InvalidBlockFound(pindex);
@@ -1922,7 +1927,7 @@ bool SetBestChain(CValidationState &state, CBlockIndex* pindexNew)
 }
 
 
-bool CBlock::AddToBlockIndex(CValidationState &state, const CDiskBlockPos &pos)
+bool CBlock::AddToBlockIndex(CValidationState &state, const CDiskBlockPos &pos, bool fCheckUnspendable)
 {
     // Check for duplicate
     uint256 hash = GetHash();
@@ -1953,7 +1958,7 @@ bool CBlock::AddToBlockIndex(CValidationState &state, const CDiskBlockPos &pos)
         return state.Abort(_("Failed to write block index"));
 
     // New best?
-    if (!ConnectBestBlock(state))
+    if (!ConnectBestBlock(state, fCheckUnspendable))
         return false;
 
     if (pindexNew == pindexBest)
@@ -2153,6 +2158,7 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
     // Get prev block index
     CBlockIndex* pindexPrev = NULL;
     int nHeight = 0;
+    bool fCheckUnspendable = false;
     if (hash != hashGenesisBlock) {
         map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashPrevBlock);
         if (mi == mapBlockIndex.end())
@@ -2191,13 +2197,15 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
                 return state.Invalid(error("AcceptBlock() : rejected nVersion<3 block"));
             }
         }
-        // Enforce block.nVersion=3 rule that the coinbase starts with serialized block height
+        // Enforce block.nVersion=3 rule that the coinbase starts with
+        // serialized block height as well as unspendable inputs rule.
         if (nVersion >= 3)
         {
             // if 750 of the last 1,000 blocks are version 3 or greater (51/100 if testnet):
             if ((!fTestNet && CBlockIndex::IsSuperMajority(3, pindexPrev, 750, 1000)) ||
                 (fTestNet && CBlockIndex::IsSuperMajority(3, pindexPrev, 51, 100)))
             {
+                fCheckUnspendable = true;
                 CScript expect = CScript() << nHeight;
                 if (vtx[0].vin[0].scriptSig.size() < expect.size() ||
                     !std::equal(expect.begin(), expect.end(), vtx[0].vin[0].scriptSig.begin()))
@@ -2217,7 +2225,7 @@ bool CBlock::AcceptBlock(CValidationState &state, CDiskBlockPos *dbp)
         if (dbp == NULL)
             if (!WriteToDisk(blockPos))
                 return state.Abort(_("Failed to write block"));
-        if (!AddToBlockIndex(state, blockPos))
+        if (!AddToBlockIndex(state, blockPos, fCheckUnspendable))
             return error("AcceptBlock() : AddToBlockIndex failed");
     } catch(std::runtime_error &e) {
         return state.Abort(_("System error: ") + e.what());

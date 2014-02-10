@@ -53,6 +53,8 @@ static const unsigned int MEMPOOL_HEIGHT = 0x7FFFFFFF;
 static const int64 DUST_SOFT_LIMIT = 100000; // 0.001 LTC
 /** Dust Hard Limit, ignored as wallet inputs (mininput default) */
 static const int64 DUST_HARD_LIMIT = 1000;   // 0.00001 LTC mininput
+/* No amount smaller than this is spendable (after version 3 block super-majority) */
+static const int64 MIN_SPENDABLE = 2; // 0.00000002 LTC
 /** No amount larger than this (in satoshi) is valid */
 static const int64 MAX_MONEY = 84000000 * COIN;
 inline bool MoneyRange(int64 nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
@@ -182,9 +184,9 @@ std::string GetWarnings(std::string strFor);
 /** Retrieve a transaction (from memory pool, or from disk, if possible) */
 bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, bool fAllowSlow = false);
 /** Connect/disconnect blocks until pindexNew is the new tip of the active block chain */
-bool SetBestChain(CValidationState &state, CBlockIndex* pindexNew);
+bool SetBestChain(CValidationState &state, CBlockIndex* pindexNew, bool fCheckUnspendable = false);
 /** Find the best known block, and make it the tip of the block chain */
-bool ConnectBestBlock(CValidationState &state);
+bool ConnectBestBlock(CValidationState &state, bool fCheckUnspendable = false);
 /** Create a new block index entry for a given block hash */
 CBlockIndex * InsertBlockIndex(uint256 hash);
 /** Verify a signature */
@@ -675,7 +677,8 @@ void UpdateCoins(const CTransaction& tx, CValidationState &state, CCoinsViewCach
     // instead of being performed inline.
     bool CheckInputs(CValidationState &state, CCoinsViewCache &view, bool fScriptChecks = true,
                      unsigned int flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_STRICTENC,
-                     std::vector<CScriptCheck> *pvChecks = NULL) const;
+                     std::vector<CScriptCheck> *pvChecks = NULL,
+                     bool fCheckUnspendable = true) const;
 
     // Apply the effects of this transaction on the UTXO set represented by view
     void UpdateCoins(CValidationState &state, CCoinsViewCache &view, CTxUndo &txundo, int nHeight, const uint256 &txhash) const;
@@ -1520,13 +1523,13 @@ public:
     bool DisconnectBlock(CValidationState &state, CBlockIndex *pindex, CCoinsViewCache &coins, bool *pfClean = NULL);
 
     // Apply the effects of this block (with given index) on the UTXO set represented by coins
-    bool ConnectBlock(CValidationState &state, CBlockIndex *pindex, CCoinsViewCache &coins, bool fJustCheck=false);
+    bool ConnectBlock(CValidationState &state, CBlockIndex *pindex, CCoinsViewCache &coins, bool fJustCheck=false, bool fCheckUnspendable=false);
 
     // Read a block from disk
     bool ReadFromDisk(const CBlockIndex* pindex);
 
     // Add this block to the block index, and if necessary, switch the active block chain to this
-    bool AddToBlockIndex(CValidationState &state, const CDiskBlockPos &pos);
+    bool AddToBlockIndex(CValidationState &state, const CDiskBlockPos &pos, bool fCheckUnspendable = false);
 
     // Context-independent validity checks
     bool CheckBlock(CValidationState &state, bool fCheckPOW=true, bool fCheckMerkleRoot=true) const;
